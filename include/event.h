@@ -5,18 +5,26 @@
 #include <deque>
 #include <mutex>
 #include <queue>
+#include <tuple>
 #include <type_traits>
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
+#include <concepts>
 
-template <typename N, typename T> 
-concept Derived = std::is_base_of<N, T>;
+// external
+#include <xenium/ramalhete_queue.hpp>
+#include <xenium/reclamation/generic_epoch_based.hpp>
+
+class EventData;
+
+template <typename T> 
+concept EventDerived = std::is_base_of<EventData, T>::value;
 
 class EventData
 {
 public:
-    template <typename T, Derived<decltype(*this)> E>
+    template <typename T, EventDerived E> 
     using mem_fun_t = void (T::*)(E*);
 public:
     virtual ~EventData() {}
@@ -24,9 +32,9 @@ public:
 
 class Submittable
 {
-public
+public:
     virtual ~Submittable() {};
-    virtual submit(const EventData* event) override;
+    virtual void submit(EventData* event) = 0;
 };
 
 // Set this to a submittable to allow events to be "built" in event data
@@ -34,7 +42,7 @@ public
 extern Submittable* global_handler;
 
 // Wrapper, allows for nice event submitting & being able to delay event submission all in 1
-template <Derived<EventData> E>
+template <EventDerived E>
 class Event
 {
 private:
@@ -57,10 +65,12 @@ class HandlerFunctionBase
 { 
 public: 
 	virtual ~HandlerFunctionBase() {}; 
-	virtual void exec(const EventData* event) = 0; 
+	virtual void exec(EventData* event) = 0; 
+    virtual std::type_index get_tinfo() = 0;
+    virtual void* get_handler_ptr() = 0;
 }; 
 
-template <typename T, Derived<EventData> E> 
+template <typename T, EventDerived E> 
 class MemberFunctionHandler : public HandlerFunctionBase 
 { 
 private:
@@ -71,14 +81,26 @@ public:
 	MemberFunctionHandler(T* instance, EventData::mem_fun_t<T, E> mem_fun) 
         : instance(instance), mem_fun(mem_fun) {}; 
 
-    void exec(const EventData* event) override;
+    void exec(EventData* event) override
+    {
+        (instance->*mem_fun)(static_cast<E*>(event));
+    }
+
+    std::type_index get_tinfo() override 
+    {
+        return std::type_index(typeid(E));
+    }
+
+    void* get_handler_ptr() override
+    {
+        return (void*) instance;
+    }
 };
 
-template <typename T, Derived<EventData> E>
-MemberFunctionHandler<T, E>::exec(const EventData* event)
-{
-    (instance->*mem_fun)(static_cast<E>(event));
-}
+template <typename T>
+using queue_type = xenium::ramalhete_queue<T,
+      xenium::policy::reclaimer<xenium::reclamation::epoch_based<>>,
+      xenium::policy::entries_per_node<1024>>;
 
 class EventManager : public Submittable
 {
@@ -86,111 +108,111 @@ private:
     // All of the handlers specific to a certain event, so the proper handlers functions can be called 
     std::unordered_multimap<std::type_index, HandlerFunctionBase*> handlers;
 
-    // All of the handlers specific to an object (so when it gets deleted those can be removed)
-    std::unordered_multimap<void*, HandlerFunctionBase*> instance_handlers; 
+    // Where handlers get added 
+    queue_type<HandlerFunctionBase*> handlers_queue;
 
-    // "Double buffering" of queues so events can be added while they are being processed 
-    std::queue<EventData*, std::deque<EventData*>>* current_event_queue;
-    std::queue<EventData*, std::deque<EventData*>>* process_event_queue;
-
-    // Handle multiple threads adding events to this handler
-    std::mutex handlers_mutex;
-    std::mutex queue_mutex;
+    // Where events get added 
+    queue_type<EventData*> event_queue;
 public:
     EventManager() 
     {
-        current_event_queue = new decltype(current_event_queue);
-        process_event_queue = new decltype(process_event_queue);
+
     }
 
     ~EventManager()
     {
-        delete back_buffer_queue;
-        delete current_event_queue;
+
     }
      
     // Adding handler of different events onto the bus
-    template <typename T, Derived<EventData> E> 
-    void subscribe(T* handler, mem_fun_t<T, E>);
+    template <typename T, EventDerived E> 
+    void subscribe(T* handler, EventData::mem_fun_t<T, E>);
 
     // Removing a handler from the bus entierly  
     template <typename T> 
     void unsubscribe(T* handler);
 
     // Add an event to the queue if a handler exists for it 
-    void submit(const EventData* event) override;
+    void submit(EventData* event) override;
 
     // Process all events stored in the queue 
-    void process_events();
+    size_t process_events();
+private:
+    // For use in both process events and unsubscribe
+    // Puts all of the handlers in the queues into the maps
+    size_t queue_to_handlers();
 };
 
-template <typename T, Derived<EventData> E> 
-void EventManager::subscribe(T* handler, mem_fun_t<T, E> mem_fun) 
+template <typename T, EventDerived E> 
+void EventManager::subscribe(T* handler, EventData::mem_fun_t<T, E> mem_fun) 
 { 
-    std::lock_guard queue_guard(queue_mutex); 
-    std::lock_guard guard(handlers_mutex);
-    auto wrapped_handler = new MemberFunctionHandler<T, E>(handler, mem_fun); 
-    handlers.insert({std::type_index(typeid(E)), wrapped_handler});
-    instance_handlers.insert({(void*) handler, wrapped_handler});
+    handlers_queue.push(new MemberFunctionHandler<T, E>(handler, mem_fun)); 
 } 
-	
-void EventManager::submit(const EventData* event) 
+
+void EventManager::submit(EventData* event) 
 { 
-    std::lock_guard(handlers_mutex);
-    if (handlers.count(std::type_index(typeid(*event)))) 
-        current_event_queue->push(event);
+    event_queue.push(event);
 }
 
-void EventManager::process_events()
+// CANNOT be called when an unsubscription is happening
+// See that class for reason
+// Also may "fail" if try pop fails and return
+// So this should be called once or twice with no pops 
+size_t EventManager::process_events()
 {
-    std::lock_guard queue_guard(queue_mutex);
+    while (queue_to_handlers() != 0);
+    size_t valid_pops = 0;
 
-    for (; current_event_queue->size() != || 
-            process_event_queue->size() != 0; )
+    EventData* event;
+    while (event_queue.try_pop(event))
     {
+        auto range = handlers.equal_range(std::type_index(typeid(event)));
+        for (auto it = range.first; it != range.second; it++)
         {
-            std::lock_guard handlers_guard(handlers_mutex);
-            std::swap(current_event_queue, process_event_queue);
+            it->second->exec(event);
         }
-
-        for (; process_event_queue->size() != 0; ) 
-        {
-            EventData* event = process_event_queue->pop();
-            auto range = handlers.equal_range(std::type_index(typeid(event)));
-            for (auto it = range.first; it != range.second; it++)
-            {
-                it->second->exec(event);
-            }
-        }
+        valid_pops++;
     }
+
+    return valid_pops;
 }
 
+// CANNOT be called when process_events is being called
+// This would be breaking anyway because a destroyed handler could be used as a handler in process_events
+// Regardless of if this function is allowed in it or not
+// Thus you cannot destroy event handlers while events are being processed
+// However it is fine if events are not being processed
 template <typename T> 
 void EventManager::unsubscribe(T* handler)
 {
-    std::lock_guard queue_guard(queue_mutex); 
-    std::lock_guard guard(handlers_mutex);
-
-    // Paranoia
-    // Maybe ill test without this
-    std::vector<decltype(handlers.begin())> erase;
-
-    for (auto it1 = handlers.begin(); it1 != handlers.end(); it1++)
-    {
-        auto range = instance_handlers.equal_range(handler);
-        for (auto it = range.first; it != range.second; it++)
+    std::erase_if(handlers, 
+        [&handler](const auto& item)
         {
-            if (it.second == it1.second) erase.push_back(it1);
-        }
-    }
-    
-    for (auto x : erase)
+            const auto& [k, v] = item;   
+            if (v.get_handler_ptr() == (void*) handler) 
+            {
+                delete v;
+                return true;
+            } 
+            return false;
+        });
+}
+
+size_t EventManager::queue_to_handlers()
+{
+    size_t valid_pops = 0;
+
+    while (true)
     {
-        delete x.second;
-        handlers.erase(x);
+        HandlerFunctionBase* handler;
+        
+        if (!handlers_queue.try_pop(handler)) break;
+        handlers.insert({handler->get_tinfo(), handler});
+
+        valid_pops++;
     }
 
-    instance_handlers.erase(handler);
+    return valid_pops;
 }
 
 // An event handler where each created event goes to multiple handler groups  
@@ -198,68 +220,108 @@ void EventManager::unsubscribe(T* handler)
 // By calling the proper handler on the proper thread
 // That is user tracked however
 // The type used to identify the handlers
+
 template <typename H>
 class MultiEventManager : public Submittable
 {
 private: 
-    std::unordered_map<H, EventManager> managers;
-     
-    std::mutex managers_mutex;
+    queue_type<std::unique_ptr<std::pair<H, HandlerFunctionBase*>>> 
+        manager_queue;
+
+    queue_type<EventData*> events;
+
+    std::unordered_map<H, std::unordered_multimap<std::type_index, 
+        HandlerFunctionBase*>> managers;
 public:
     // Adding handlers of different events onto a specific handler (could be new)
-    template <typename T, Derived<EventData> E>
-    void subscribe(const H& manager, T* handler, mem_fun_t<T, E> mem_fun);
+    template <typename T, EventDerived E>
+    void subscribe(const H& manager, T* handler, 
+            EventData::mem_fun_t<T, E> mem_fun);
      
     // Unsubscribes a handler
     template <typename T>
-    void unsubscibe(const H& manager, T* handler);
+    void unsubscribe(const H& manager, T* handler);
 
     // Add an event to the queue
-    void submit(const EventData* event) override;
-
-    // Add an event to one handler 
-    void submit(const H& manager, const EventData* event); 
+    void submit(EventData* event) override;
 
     // Process all events stored on one handler
-    void process_events(const H& manager);
+    size_t process_events(const H& manager);
+private:
+    // For use in both process events and unsubscribe
+    // Puts all of the handlers in the queues into the maps
+    size_t queue_to_managers();
 };
 
-template <typename H, typename T, Derived<EventData> E>
+template <typename H>
+template <typename T, EventDerived E> 
 void MultiEventManager<H>::subscribe(const H& manager, T* handler, 
-        mem_fun<T, E> mem_fun)
+        EventData::mem_fun_t<T, E> mem_fun)
 {
-    std::lock_guard(managers_mutex);
-    if (!managers.contains(manager)) managers.insert({manager, EventData()});
-    managers[manager].subscribe(handler, mem_fun);
-}
-
-template <typename H, typename T> 
-void MultiEventManager<H>::unsubscribe(const H& manager, T* handler)
-{
-    std::lock_guard(managers_mutex);
-    managers[manager].unsubscibe(handler);
-}
-
-template <typename H> 
-void MultiEventManager<H>::submit(const EventData* event) 
-{
-    std::lock_guard(managers_mutex);
-    for (auto [k, v] : managers)
-    {
-        v.submit(event);
-    }
+    manager_queue.push(std::make_unique(std::pair(managers, 
+        new MultiEventManager(handler, mem_fun))));
 }
 
 template <typename H>
-void MultiEventManager<H>::submit(const H& manager, const EventData* event)
+template <typename T> 
+void MultiEventManager<H>::unsubscribe(const H& manager, T* handler)
 {
-    std::lock_guard(managers_mutex);
-    managers[manager].submit(event);
+    while (queue_to_managers() != 0);
+    std::erase_if(managers[manager], 
+        [&handler](const auto& item)
+        {
+            const auto& [k, v] = item;   
+            if (v.get_handler_ptr() == (void*) handler) 
+            {
+                delete v;
+                return true;
+            } 
+            return false;
+        });
 }
 
-template <typename H> MultiEventManager<H>::process_events(const H& manager)
+template <typename H> 
+void MultiEventManager<H>::submit(EventData* event) 
 {
-    std::lock_guard(managers_mutex);
-    managers[manager].process_events();
+    events.push(event);
 }
 
+template <typename H> 
+size_t MultiEventManager<H>::process_events(const H& manager)
+{
+    while (queue_to_managers() != 0);
+    size_t valid_pops = 0;
+    
+    EventData* event;
+    while (events.try_pop(event))
+    {
+        auto range = managers[manager].equal_range(
+                std::type_index(typeid(event)));
+        for (auto it = range.first; it != range.second; it++)
+        {
+            it->second->exec(event);
+        }
+        valid_pops++;
+    }
+
+    return valid_pops;
+}
+
+template <typename H> 
+size_t MultiEventManager<H>::queue_to_managers()
+{
+    size_t valid_pops = 0; 
+
+    while (true)
+    {
+        std::unique_ptr<std::pair<H, HandlerFunctionBase*>> manager;  
+        if (!manager_queue.try_pop(manager)) break;
+        
+        managers[manager->first].insert({manager->second.get_tinfo(), 
+                manager->second});
+        
+        valid_pops++;
+    }
+
+    return valid_pops;
+}
