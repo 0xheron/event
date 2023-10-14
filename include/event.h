@@ -2,6 +2,7 @@
 
 // std
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <queue>
@@ -10,6 +11,7 @@
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
+#include <map>
 #include <concepts>
 
 // external
@@ -99,14 +101,14 @@ public:
 
 template <typename T>
 using queue_type = xenium::ramalhete_queue<T,
-      xenium::policy::reclaimer<xenium::reclamation::epoch_based<>>,
+      xenium::policy::reclaimer<xenium::reclamation::new_epoch_based<>>,
       xenium::policy::entries_per_node<1024>>;
 
 class EventManager : public Submittable
 {
 private:
     // All of the handlers specific to a certain event, so the proper handlers functions can be called 
-    std::unordered_multimap<std::type_index, HandlerFunctionBase*> handlers;
+    std::multimap<std::type_index, HandlerFunctionBase*> handlers;
 
     // Where handlers get added 
     queue_type<HandlerFunctionBase*> handlers_queue;
@@ -164,9 +166,10 @@ size_t EventManager::process_events()
     size_t valid_pops = 0;
 
     EventData* event;
-    while (event_queue.try_pop(event))
+    while (true)
     {
-        auto range = handlers.equal_range(std::type_index(typeid(event)));
+        if (!event_queue.try_pop(event)) break;
+        auto range = handlers.equal_range(std::type_index(typeid(*event)));
         for (auto it = range.first; it != range.second; it++)
         {
             it->second->exec(event);
@@ -230,7 +233,7 @@ private:
 
     queue_type<EventData*> events;
 
-    std::unordered_map<H, std::unordered_multimap<std::type_index, 
+    std::unordered_map<H, std::multimap<std::type_index, 
         HandlerFunctionBase*>> managers;
 public:
     // Adding handlers of different events onto a specific handler (could be new)
@@ -258,8 +261,9 @@ template <typename T, EventDerived E>
 void MultiEventManager<H>::subscribe(const H& manager, T* handler, 
         EventData::mem_fun_t<T, E> mem_fun)
 {
-    manager_queue.push(std::make_unique(std::pair(managers, 
-        new MultiEventManager(handler, mem_fun))));
+    manager_queue.push(std::make_unique<std::pair<H, HandlerFunctionBase*>>(
+                std::pair(manager, new MemberFunctionHandler(handler, 
+                        mem_fun))));
 }
 
 template <typename H>
@@ -289,14 +293,13 @@ void MultiEventManager<H>::submit(EventData* event)
 template <typename H> 
 size_t MultiEventManager<H>::process_events(const H& manager)
 {
-    while (queue_to_managers() != 0);
     size_t valid_pops = 0;
     
     EventData* event;
     while (events.try_pop(event))
     {
         auto range = managers[manager].equal_range(
-                std::type_index(typeid(event)));
+                std::type_index(typeid(*event)));
         for (auto it = range.first; it != range.second; it++)
         {
             it->second->exec(event);
@@ -317,7 +320,7 @@ size_t MultiEventManager<H>::queue_to_managers()
         std::unique_ptr<std::pair<H, HandlerFunctionBase*>> manager;  
         if (!manager_queue.try_pop(manager)) break;
         
-        managers[manager->first].insert({manager->second.get_tinfo(), 
+        managers[manager->first].insert({manager->second->get_tinfo(), 
                 manager->second});
         
         valid_pops++;
