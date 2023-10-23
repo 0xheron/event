@@ -15,6 +15,22 @@
 #include <type_traits>
 #include <vector>
 
+template <typename T>
+concept Clock = std::same_as<T, std::chrono::high_resolution_clock> || std::same_as<T, std::chrono::steady_clock> || std::same_as<T, std::chrono::system_clock>;
+
+template <Clock T = std::chrono::high_resolution_clock>
+class Timer
+{
+private:
+    std::chrono::time_point<T> start;
+public:
+    Timer() { reset_timer(); }
+
+    void reset_timer() { start = T::now(); }
+    float get_time() const { return std::chrono::duration_cast<std::chrono::seconds>(T::now() - start).count(); }
+    std::chrono::nanoseconds get_time_ns() const { return std::chrono::duration_cast<std::chrono::nanoseconds>(T::now() - start); }
+};
+
 class Event
 {
 public:
@@ -311,7 +327,7 @@ template <typename T>
 size_t count_sort(std::vector<std::pair<T, size_t>>& input, 
     std::vector<std::pair<T, size_t>>& output, size_t exp)
 {
-    char count[10] = {0};
+    size_t count[10] = {0};
     
     size_t max_val = 0;
     for (size_t i = 0; i < input.size(); i++) 
@@ -395,7 +411,7 @@ void MultiEventManager::move_to_processors()
         event_count - subtracted); 
 
     stored.resize(event_got);
-
+    
     auto copy_to = radix(stored);
     auto event_shared = create_delete_shared(copy_to);
 
