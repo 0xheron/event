@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <concepts>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -30,6 +31,62 @@ public:
     float get_time() const { return std::chrono::duration_cast<std::chrono::seconds>(T::now() - start).count(); }
     std::chrono::nanoseconds get_time_ns() const { return std::chrono::duration_cast<std::chrono::nanoseconds>(T::now() - start); }
 };
+
+#ifdef USE_X86INTRINSICS
+#include <intrin.h>
+#pragma intrinsic(_BitScanForward64)
+#pragma intrinsic(_BitScanReverse64)
+
+/**
+ * bitScanForward
+ * @param bb bitboard to scan
+ * @precondition bb != 0
+ * @return index (0..63) of least significant one bit
+ */
+int bit_scan_fw(U64 x) {
+   unsigned long index;
+   assert (x != 0);
+   _BitScanForward64(&index, x);
+   return (int) index;
+}
+
+/**
+ * bitScanReverse
+ * @param bb bitboard to scan
+ * @precondition bb != 0
+ * @return index (0..63) of most significant one bit
+ */
+int bit_scan_rv(U64 x) {
+   unsigned long index;
+   assert (x != 0);
+   _BitScanReverse64(&index, x);
+   return (int) index;
+}
+#else
+
+/**
+ * bitScanForward
+ * @param bb bitboard to scan
+ * @precondition bb != 0
+ * @return index (0..63) of least significant one bit
+ */
+inline int bit_scan_fw(uint64_t x) 
+{
+   asm ("bsfq %0, %0" : "=r" (x) : "0" (x));
+   return (int) x;
+}
+
+/**
+ * bitScanReverse
+ * @param bb bitboard to scan
+ * @precondition bb != 0
+ * @return index (0..63) of most significant one bit
+ */
+inline int bit_scan_rv(uint64_t x) {
+   asm ("bsrq %0, %0" : "=r" (x) : "0" (x));
+   return (int) x;
+}
+#endif
 
 class Event
 {
@@ -283,6 +340,7 @@ private:
     std::atomic<size_t> event_count = 0;
     std::vector<EventProcessor> processors;
 
+    // Event queue
     moodycamel::ConcurrentQueue<std::pair<Event*, size_t>> event_queue;
 
     // Processor and subscribe mutex
@@ -319,63 +377,130 @@ public:
     void process_events(size_t processor_id);
 
     // Takes events and moves them onto the processors so they can efficiently process events and properly delete them 
-    // Not thread safe except with submit  
+    // Thread safe only with submit 
     void move_to_processors();
 };
 
-template <typename T> 
-size_t count_sort(std::vector<std::pair<T, size_t>>& input, 
-    std::vector<std::pair<T, size_t>>& output, size_t exp)
+// Count sort in base N
+template <typename T, size_t N> 
+void count_sort(std::vector<std::pair<T, size_t>>& input, 
+    std::vector<std::pair<T, size_t>>& output, size_t iterations)
 {
-    size_t count[10] = {0};
+    size_t count[N] = {0};
+    size_t exp = std::pow(N, iterations); 
     
-    size_t max_val = 0;
     for (size_t i = 0; i < input.size(); i++) 
     {
-        count[(input[i].second / exp) % 10]++;
-        if (input[i].second > max_val) max_val = input[i].second;
+        count[(input[i].second / exp) % N]++;
     }
 
-    for (size_t i = 1; i < 10; i++) 
+    for (size_t i = 1; i < N; i++) 
         count[i] += count[i - 1];
 
-    for (long long i = input.size() - 1; i >= 0; i--)
+    for (size_t i = input.size(); i > 0; i--)
     {
-        output[count[(input[i].second / exp) % 10] - 1] = input[i];
-        count[(input[i].second / exp) % 10]--;
+        output[count[(input[i - 1].second / exp) % N] - 1] = input[i - 1];
+        count[(input[i - 1].second / exp) % N]--;
+    }
+}
+
+// Radix with base N
+template <typename T, size_t N> 
+void radix(std::vector<std::pair<T, size_t>>& input)
+{
+    std::vector<std::pair<T, size_t>> s_input(input.size());
+    size_t iterations = 0;
+    size_t max_num = max_val(input);
+
+    while (max_num / (size_t) std::pow(N, iterations))
+    {
+        count_sort<T, N>(iterations % 2 == 0 ? input : s_input, 
+            iterations % 2 == 0 ? s_input : input, iterations);   
+        iterations++;
     }
 
+    if (iterations % 2) input = s_input;
+}
+
+template <typename T> 
+size_t max_val(const std::vector<std::pair<T, size_t>>& input)
+{
+    size_t max_val = 0;
+    for (auto& v : input)
+    {
+        max_val = max_val < v.second ? v.second : max_val;
+    }
     return max_val;
 }
 
-template <typename T> 
-std::vector<std::pair<T, size_t>> radix(
+consteval size_t compile_pow(size_t base, size_t exp) 
+{ 
+    size_t rval = base;
+    for (size_t i = 0; i < exp; i++) rval *= base; 
+    return rval; 
+}
+
+// Multithreaded radix, splits the numbers into buckets and then calls radix on each bucket with base N
+template <typename T, size_t N, size_t base = 4>
+std::vector<T> multithreaded_radix(
     std::vector<std::pair<T, size_t>>& input)
 {
-    std::vector<std::pair<T, size_t>> s_input(input.size());
-    
-    size_t max_num = 0;
-    size_t iterations = 0;
-    do 
-    {
-        max_num = count_sort(iterations % 2 == 0 ? input : s_input, 
-            iterations % 2 == 0 ? s_input : input, std::pow(10, iterations));   
-        iterations++;
-    } while (max_num / (size_t) std::pow(10, iterations));
+    size_t max_num = max_val(input);
 
-    return iterations % 2 ? input : s_input; 
+    if (max_num == 0)
+    {
+        std::vector<T> output;
+        for (auto& val : input)
+        {
+            output.push_back(val.first); 
+        }
+        
+        return output;
+    }
+    
+    // Each bucket for each thread
+    std::array<
+        std::vector<std::pair<Event*, size_t>>, compile_pow(2, base)> buckets;
+
+    for (size_t i = 0; i < input.size(); i++)
+    {
+        buckets[input[i].second >> 
+            (bit_scan_rv(max_num) + 1 - base)].push_back(input[i]);
+    }
+
+    Timer timer;
+
+    std::array<std::thread, compile_pow(2, base)> threads;
+    for (size_t i = 0; i < threads.size(); i++)
+    {
+        threads[i] = std::thread(radix<T, N>, std::ref(buckets[i]));
+    }
+
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+
+    std::vector<T> output;
+
+    for (auto& bucket : buckets)
+    {
+        for (auto& val : bucket)
+        {
+            output.push_back(val.first);
+        }
+    }
+
+    return output;
 }
 
 std::shared_ptr<DeletePointerView<Event>[]> create_delete_shared(
-    const std::vector<std::pair<Event*, size_t>>& input)
+    const std::vector<Event*>& input)
 {
     auto shared_ptr = new DeletePointerView<Event>[input.size()];
     auto output = std::shared_ptr<DeletePointerView<Event>[]>(shared_ptr);
-     
-    for (size_t i = 0; i < input.size(); i++)
-    {
-        output[i] = DeletePointerView<Event>(input[i].first);     
-    }
+    memcpy((void*) shared_ptr, (void*) input.data(), 
+        input.size() * sizeof(DeletePointerView<Event>)); 
 
     return output;
 }
@@ -411,8 +536,8 @@ void MultiEventManager::move_to_processors()
         event_count - subtracted); 
 
     stored.resize(event_got);
-    
-    auto copy_to = radix(stored);
+
+    auto copy_to = multithreaded_radix<Event*, 32>(stored);
     auto event_shared = create_delete_shared(copy_to);
 
     for (auto& processor : processors)
